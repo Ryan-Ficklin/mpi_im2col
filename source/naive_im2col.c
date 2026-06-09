@@ -25,10 +25,6 @@ int main(int argc, char **argv)
   int M_width, M_height, K_width, K_height, stride;
   double start_time, end_time;
 
-  /* counts and displacements for scattering the input matrix */
-  int *scatter_counts = NULL;
-  int *scatter_displs = NULL;
-
   /* counts and displacements for gathering the resultant col */
   int *gather_counts = NULL;
   int *gather_displs = NULL;
@@ -59,77 +55,44 @@ int main(int argc, char **argv)
   K_height = atoi(argv[4]);
   stride = atoi(argv[5]);
 
-  /* how many rows for each process to distribute  */
-  int base = M_height / nprocs;
-  int rem = M_height % nprocs;
-  int local_rows = base + (rank < rem);
-  /* where each nput row should start */
-  int global_start_row = rank * base + (rank < rem ? rank : rem);
-  
   /* column output dimensions, taken from sequential code */
-  int out_h = (M_height - K_height) / stride + 1;
+  int out_h = (M_height - K_height) / stride + 1; /* number of rows */
   int out_w = (M_width - K_width) / stride + 1;
   /* calculate the total number of elements in our convultion column */
   int col_out_size = out_h * out_w * K_width * K_height;  
   
-  /* reading previous input rows according to the height from the kernel */
-  int shared_rows = 0;
-  /* all except the last rank need to look forward up to their kernel height */
-  if (rank < nprocs - 1) {
-    shared_rows = K_height - 1;
-  }
-  int allocated_rows = local_rows + shared_rows; 
 
-  /* get our local M buffer 
-   * i.e. the buffer for this process's set of M's rows */
-  MATRIX local_M = (MATRIX)scalloc(allocated_rows * M_width,sizeof(float)); 
+  /* distribute output rows to each process */
+  /* how many rows for each process to distribute  */
+  int base = out_h / nprocs;
+  int rem = out_h % nprocs;
+  int local_rows = base + (rank < rem); 
+  int start_offset = 0;
+  for (int i = 0; i < rank; i++){
+    start_offset += base + (i < rem);
+  }
 
-  /* get our local result buffer 
-   * i.e. the buffer for this process to store its col matrix portion */
-  int local_out_rows = local_rows;
-  if (global_start_row + local_out_rows > out_h) {
-    local_out_rows = out_h - global_start_row;
-  }
-  if (local_out_rows < 0) {
-    local_out_rows = 0;
-  }
-  
-  int block_size = out_w * K_width * K_height;
-  int local_col_out_size = local_out_rows * block_size;
+
+  int local_col_out_size = local_rows * out_w * K_width * K_height;
   MATRIX result = (MATRIX)scalloc(local_col_out_size,sizeof(float)); 
   
+  /* allocate space for M broadcast */
+  if(rank != ROOT) {
+    M = (MATRIX) scalloc(M_width*M_height, sizeof(float));
+  }
   if(rank == ROOT)
   {
     /* get the counts and displacements for scattering */
-    scatter_counts = (int*)smalloc(nprocs * sizeof(int));
-    scatter_displs = (int*)smalloc(nprocs * sizeof(int));
     gather_counts = (int*)smalloc(nprocs * sizeof(int));
     gather_displs = (int*)smalloc(nprocs * sizeof(int));
-
-    int scatter_offset = 0;
     int gather_offset = 0;
 
     /* fill out the count and displacement lists for scattering and gathering */
     for (int i = 0; i < nprocs; i++)
     {
       int rows_i = base + (i < rem);
-
-      /* proportional to local_M */
-      scatter_counts[i] = rows_i * M_width;
-      scatter_displs[i] = scatter_offset;
-      scatter_offset += scatter_counts[i];
-      
-      /* proportional to result/out_rows */
-      int start_i = i * base + (i < rem ? i : rem);
-      int out_rows_i = rows_i;
-      if (start_i + out_rows_i > out_h) {
-        out_rows_i = out_h - start_i;
-      }
-      if (out_rows_i < 0) {
-        out_rows_i = 0;
-      }
-
-      gather_counts[i] = out_rows_i * block_size;
+ 
+      gather_counts[i] = rows_i * out_w * K_width * K_height;
       gather_displs[i] = gather_offset;
       gather_offset += gather_counts[i];
     }
@@ -142,60 +105,18 @@ int main(int argc, char **argv)
     /* start timing right before broadcast and scattering starts */
     start_time = MPI_Wtime();
   }
+
+  MPI_Bcast(M, M_width*M_height, MPI_FLOAT, ROOT, MPI_COMM_WORLD);
   
-  MPI_Scatterv(M, scatter_counts, scatter_displs, MPI_FLOAT, local_M, local_rows * M_width, MPI_FLOAT, ROOT, MPI_COMM_WORLD);
-  
-  /* exchange boundary rows 
-   * fetching from rows below us */
-  MPI_Request reqs[2];
-  int request_count = 0;
-
-  // receiving shared rows 
-  if (rank < nprocs - 1 && shared_rows > 0) 
-  {
-    // recv the rows from the next process 
-    MPI_Irecv(local_M + (local_rows * M_width),
-              shared_rows * M_width,
-              MPI_FLOAT,
-              rank + 1,
-              0,
-              MPI_COMM_WORLD,
-              &reqs[request_count++]);
-  }
-
-  // sending shared rows 
-  if (rank > 0) {
-    /* send as many of my rows as the previous process needs */
-    int rows_to_send;
-    if (local_rows < (K_height - 1)) {
-      rows_to_send = local_rows;
-    } else {
-      rows_to_send = (K_height-1);
-    }
-    /* send last row to next process */
-    MPI_Isend(local_M, 
-              rows_to_send * M_width,
-              MPI_FLOAT,
-              rank - 1,
-              0,
-              MPI_COMM_WORLD,
-              &reqs[request_count++]);
-  }
-
-  /* wait for row exchange */
-  if (request_count > 0) {
-    MPI_Waitall(request_count, reqs, MPI_STATUSES_IGNORE);
-  }
-
   /* im2col calculation */
   int col_idx = 0;
 
-  for (int oh = 0; oh < local_out_rows; oh++) {
+  for (int oh = 0; oh < local_rows; oh++) {
     for (int ow = 0; ow < out_w; ow++) {
       for (int kh = 0; kh < K_height; kh++) {
         for (int kw = 0; kw < K_width; kw++) {
           //col[col_idx++] = image[(oh * stride + kh) * W + (ow * stride + kw)];
-          result[col_idx++] = local_M[(oh * stride + kh) * M_width + (ow * stride + kw)];
+          result[col_idx++] = M[((oh + start_offset) * stride + kh) * M_width + (ow * stride + kw)];
         }
       }
     }
@@ -207,9 +128,9 @@ int main(int argc, char **argv)
   if(rank == ROOT)
   {
     end_time = MPI_Wtime();
-    printf("HALO:\n");
+    printf("NAIVE:\n");
+    //printf("Time: %lf seconds\n", M_width, M_height, nprocs, end_time - start_time);
     printf("Time: %lf seconds\n", end_time - start_time);
-
     /* test if the matrix is the same as sequential */
 
     MATRIX sequential_col_out = (MATRIX) scalloc(col_out_size, sizeof(float));
@@ -221,7 +142,6 @@ int main(int argc, char **argv)
     } else {
       printf("The matrices are the same!\n");
     }
-
     /* teardown */
     free(sequential_col_out);
   }
@@ -229,14 +149,11 @@ int main(int argc, char **argv)
   /* teardown */
   if (rank == ROOT)
   {
-    free(M);
     free(col_out);
-    free(scatter_counts);
-    free(scatter_displs);
     free(gather_counts);
     free(gather_displs);
   }
-  free(local_M);
+  free(M);
   free(result);
 
   MPI_Finalize();
