@@ -11,7 +11,6 @@ typedef float * MATRIX;
 
 // helpers for matrix creation/debugging
 MATRIX make_matrix(int N, int M);
-MATRIX multiply(MATRIX A, MATRIX B, int N);
 void print_matrix(MATRIX M, int N);
 int check_matrices(MATRIX A, MATRIX B, int size);
 

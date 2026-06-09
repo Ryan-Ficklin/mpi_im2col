@@ -1,1 +1,102 @@
+Ryan Ficklin
 mpi im2col
+
+For this assignment, I have created two solutions, found in ./source 
+I have assumed an image is just a float*, as specified in the example sequential
+code. I generate a random float* of floats from 0-1 instead of reading in a real
+image, although I do not see why my solution(s) are not generalizable to real 
+images as well.
+
+PROJECT STRUCTURE
+
+.
+├── build
+│   ├── im2col
+│   ├── im2col.o
+│   ├── naive_im2col
+│   └── naive_im2col.o
+├── Makefile
+├── README
+└── source
+    ├── im2col.c
+    ├── naive_im2col.c
+    ├── salloc.h
+    └── test.c
+
+test.c was for my own testing purposes and can be ignored.
+salloc.h is a header file I've had for a while that automatically checks 
+allocation system calls for failure. 
+The some MPI conventions and various helper functions (i.e. make_matrix, print_matrix) 
+I have used in my solutions have been brought over from my time in CSC 364, which
+had a sizeable unit on MPI, including an MPI distributed matrix multiplication 
+lab (which is where I first wrote many of these hlepers). 
+
+im2col.c represents my best attempt at a reasonable distributed algorithm for im2col
+
+The basic outline is as follows:
+  1. Create the M on rank 0 
+  2. Allocate space for the rows of the resultant matrix (hencefore the Col)
+    2a. Make sure the rows include space allocated for rows to be sent and recieved 
+  3. Calculate the scatter offsets based on the size of M, calculate gather offsets
+     based on the size of Col
+  4. MPI_Scatterv() based on the scatter offsets
+  5. Halo exchange the boundary rows 
+    5a. MPI_Isend() my beginning rows to the previous process
+    5b. MPI_Irecv() the rows from the next process to the end of my current rows
+  6. MPI_Waitall() until the sending/recving is complete
+  7. Perform the im2col operation on the rows allocated to this process
+  8. MPI_Gatherv() based on the gather offsets (now in the size of Col), collected in rank 0
+  9. On rank 0, check the generated Col against the sequential single-thread algortihm 
+     provided in the specifications 
+  10. free(), MPI_Finalize(), teardown
+
+This algorithm represents my best understanding of how to efficiently share data
+using MPI in order to perform the im2col operations. 
+
+However, my best understanding is not good enough. I could not figure out how 
+stride effects which rows must be shared via halo exchange for strides that are 
+not 1. 
+
+naive_im2col.c attempts to remedy that with a simpler (though less dynamic and 
+interesting) algorithm
+
+The basic outline is as follows:
+  1. Create M
+  2. Allocate space for Col (without rows allocated for halo exchange) 
+  3. Calculate the gather offsets based on the size of Col
+  4. MPI_Bcast() all of M from rank 0 to all other processes 
+  5. Perform im2col operation on the rows allocated to this process 
+  6. MPI_Gatherv() based on gather offsets, collected in rank 0
+  7. On rank 0, check the generated Col against a sequential version 
+  8. free(), MPI_Finalize(), teardown
+
+Obviously, if the matrix is too large to be stored in memory, a likely motivation
+for distributing this algorithm in the first place, then broadcasting all of M
+is not feasible. However, this version only has to worry about the rows of the 
+Col matrix to distribute amongst processes, instead of the confusing mapping of
+scattering based on M's rows and gathering based on Col's different sized and numbered
+rows. This simplification makes stride a non-issue, thus naive_im2col can handle
+strides >= 1 (where im2col cannot).
+
+RUNNING
+
+There is a Makefile present in this project. 
+$make
+will generate the build directory with both im2col and naive_im2col binaries.
+They can ran with 
+$mpirun -np <number of processes> <im2col | naive_im2col> <M_width> <M_height> <K_width> <K_height> <stride>
+
+Although there is a test setup as well with
+$make test
+Which will compare both im2col and naive_im2col, using variables defined in 
+the makefile to test different sizes, kernels, and strides.
+
+FINAL NOTES
+
+I have included a picture, whiteboard.jpg in this submission. It is not intended
+to be very comprehensible. It is an artifact of my brainstorming in the Grad
+Student Lounge trying to figure out the im2col operation and the ways to 
+distribute it. I include it to show that I have thought deeply about this project,
+despite what I see as a flawed submission. 
+
+Thank you
