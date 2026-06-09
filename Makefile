@@ -27,13 +27,13 @@ $(BUILD_DIR):
 clean:
 	rm -rf $(BUILD_DIR)
 
-N=1000
+N=100
 test: $(MATRIX_BIN)
 	@echo testing on $(N)x$(N) matrices of random floats from 0-1
 	@echo 1 process
-	mpirun -np 1 $(MATRIX_BIN) $(N)
+	mpirun -np 1 $(MATRIX_BIN) $(N) $(N) 3 3 1 
 	@echo 2 processes
-	mpirun -np 2 $(MATRIX_BIN) $(N)
+	mpirun -np 2 $(MATRIX_BIN) $(N) $(N) 3 3 1 
 	@echo 4 processes
-	mpirun -np 4 $(MATRIX_BIN) $(N)
+	mpirun -np 4 $(MATRIX_BIN) $(N) $(N) 3 3 1 
 	

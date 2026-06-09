@@ -10,7 +10,7 @@
 typedef float * MATRIX;
 
 // helpers for matrix creation/debugging
-MATRIX make_matrix(int N);
+MATRIX make_matrix(int N, int M);
 MATRIX multiply(MATRIX A, MATRIX B, int N);
 void print_matrix(MATRIX M, int N);
 
@@ -21,107 +21,186 @@ void im2col(MATRIX image, MATRIX col, int H, int W, int K_h, int K_w, int stride
 int main(int argc, char **argv)
 {
   int rank, nprocs;
-  // NxN matrices 
-  int N;
+  int M_width, M_height, K_width, K_height, stride;
   double start_time, end_time;
-  int *counts = NULL;
-  int *displs = NULL;
+
+  /* counts and displacements for scattering the input matrix */
+  int *scatter_counts = NULL;
+  int *scatter_displs = NULL;
+
+  /* counts and displacements for gathering the resultant col */
+  int *gather_counts = NULL;
+  int *gather_displs = NULL;
 
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+  
+  // M: our original matrix
+  // col_out: the column which can be used for convolution
+  MATRIX M = NULL, col_out = NULL;
 
-  MATRIX A, B, M;
-
-  if (argc != 2)
+  if (argc != 6)
   {
     if (rank == ROOT)
     {
-      printf("Usage: mpirun -np P %s N\n", argv[0]);
+      printf("Usage: mpirun -np P %s <M-Width> <M-Height> <K-Width> <K-Height> <Stride>\n", argv[0]);
     }
     MPI_Finalize();
     return FAIL;
   }
   
-  N = atoi(argv[1]);
+  // size of matrix
+  M_width = atoi(argv[1]);
+  M_height = atoi(argv[2]);
+  // size of kernel/filter
+  K_width = atoi(argv[3]);
+  K_height = atoi(argv[4]);
+  stride = atoi(argv[5]);
 
-  /* how many rows for each process */
-  int base = N / nprocs;
-  int rem = N % nprocs;
+  /* how many rows for each process to distribute  */
+  int base = M_height / nprocs;
+  int rem = M_height % nprocs;
   int local_rows = base + (rank < rem);
-  int local_size = local_rows * N;
-  /* get our local A buffer */
-  MATRIX local_A = (MATRIX)scalloc(local_size,sizeof(float)); 
-  /* get our local buffer for result */
-  MATRIX result = (MATRIX)scalloc(local_size,sizeof(float));
   
-  /* every rank needs space for B as well. ROOT will be the only process
-   * to actually make the matrix originally */
-  if(rank != ROOT)
-  {
-    B = (MATRIX) scalloc(N*N,sizeof(float));
+  /* column output dimensions, taken from sequential code */
+  int out_h = (M_height - K_height) / stride + 1;
+  int out_w = (M_width - K_width) / stride + 1;
+  /* calculate the total number of elements in our convultion column */
+  int col_out_size = out_h * out_w * K_width * K_height;  
+  
+  /* reading previous input rows according to the height from the kernel */
+  int shared_rows = 0;
+  /* all except the last rank need to look forward up to their kernel height */
+  if (rank < nprocs - 1) {
+    shared_rows = K_height - 1;
   }
+  int allocated_rows = local_rows + shared_rows; 
 
+  /* get our local M buffer 
+   * i.e. the buffer for this process's set of M's rows */
+  MATRIX local_M = (MATRIX)scalloc(allocated_rows * M_width,sizeof(float)); 
+
+  /* get our local result buffer 
+   * i.e. the buffer for this process to store its col matrix portion */
+  //int local_out_h = local_rows; 
+  int block_size = out_w * K_width * K_height;
+  int local_col_out_size = local_rows * block_size;
+  MATRIX result = (MATRIX)scalloc(local_col_out_size,sizeof(float)); 
+  
   if(rank == ROOT)
   {
     /* get the counts and displacements for scattering */
-    counts = (int*)smalloc(nprocs * sizeof(int));
-    displs = (int*)smalloc(nprocs * sizeof(int));
+    scatter_counts = (int*)smalloc(nprocs * sizeof(int));
+    scatter_displs = (int*)smalloc(nprocs * sizeof(int));
+    gather_counts = (int*)smalloc(nprocs * sizeof(int));
+    gather_displs = (int*)smalloc(nprocs * sizeof(int));
 
-    int off = 0;
+    int scatter_offset = 0;
+    int gather_offset = 0;
+
+    /* fill out the count and displacement lists for scattering and gathering */
     for (int i = 0; i < nprocs; i++)
     {
       int rows_i = base + (i < rem);
-      counts[i] = rows_i * N;
-      displs[i] = off;
-      off += counts[i];
+      /* proportional to local_M */
+      scatter_counts[i] = rows_i * M_width;
+      scatter_displs[i] = scatter_offset;
+      scatter_offset += scatter_counts[i];
+      
+      /* proportional to result */
+      gather_counts[i] = rows_i * block_size;
+      gather_displs[i] = gather_offset;
+      gather_offset += gather_counts[i];
     }
   
     srand(time(NULL));
     /* get our matrices */
-    A = make_matrix(N);
-    B = make_matrix(N);
+    M = make_matrix(M_width, M_height);
     /* allocate memory for result matrix */
-    M = (MATRIX) scalloc(N*N, sizeof(float));
+    col_out = (MATRIX) scalloc(col_out_size, sizeof(float));
     /* start timing right before broadcast and scattering starts */
     start_time = MPI_Wtime();
   }
   
-  /* just give B to everyone else. Block decomp would be better, oh well */
-  MPI_Bcast(B, N*N, MPI_FLOAT, ROOT, MPI_COMM_WORLD);
-  MPI_Scatterv(A, counts, displs, MPI_FLOAT, local_A, local_size, MPI_FLOAT, ROOT, MPI_COMM_WORLD);
+  MPI_Scatterv(M, scatter_counts, scatter_displs, MPI_FLOAT, local_M, local_rows * M_width, MPI_FLOAT, ROOT, MPI_COMM_WORLD);
+  
+  /* exchange boundary rows 
+   * fetching from rows below us */
+  MPI_Request reqs[2];
+  int request_count = 0;
 
-  /* same matrix computation as before */
-  for(int r = 0; r < local_rows; r++){
-    for(int c = 0; c < N; c++){
-      for(int i = 0; i < N; i++){
-        result[r*N + c] += local_A[r*N + i] * B[i*N + c];
+  // receiving shared rows 
+  if (rank < nprocs - 1 && shared_rows > 0) 
+  {
+    // recv the rows from the next process 
+    MPI_Irecv(local_M + (local_rows * M_width),
+              shared_rows * M_width,
+              MPI_FLOAT,
+              rank + 1,
+              0,
+              MPI_COMM_WORLD,
+              &reqs[request_count++]);
+  }
+
+  // sending shared rows 
+  if (rank > 0) {
+    /* send as many of my rows as the previous process needs */
+    /*int rows_to_send = local_rows;
+    if (((M_height / nprocs) + (rank - 1 < rem)) >= (K_height - 1)) {
+      rows_to_send = K_height - 1;
+    }*/
+    /* send last row to next process */
+    MPI_Isend(local_M, 
+              (K_height - 1) * M_width,
+              MPI_FLOAT,
+              rank - 1,
+              0,
+              MPI_COMM_WORLD,
+              &reqs[request_count++]);
+  }
+
+  /* wait for row exchange */
+  if (request_count > 0) {
+    MPI_Waitall(request_count, reqs, MPI_STATUSES_IGNORE);
+  }
+
+  /* im2col calculation */
+  int col_idx = 0;
+
+  for (int oh = 0; oh < local_rows; oh++) {
+    if ((rank * base + (rank < rem ? rank : rem) + oh) >= out_h) break;
+
+    for (int ow = 0; ow < out_w; ow++) {
+      for (int kh = 0; kh < K_height; kh++) {
+        for (int kw = 0; kw < K_width; kw++) {
+          //col[col_idx++] = image[(oh * stride + kh) * W + (ow * stride + kw)];
+          result[col_idx++] = local_M[(oh * stride + kh) * M_width + (ow * stride + kw)];
+        }
       }
     }
   }
 
-  MPI_Gatherv(result, local_size, MPI_FLOAT, M, counts, displs, MPI_FLOAT, ROOT, MPI_COMM_WORLD);
+  MPI_Gatherv(result, local_col_out_size, MPI_FLOAT, col_out, gather_counts, gather_displs, MPI_FLOAT, ROOT, MPI_COMM_WORLD);
   
   /* final matrix */
   if(rank == ROOT)
   {
     end_time = MPI_Wtime();
-    printf("N: %d, Processes: %d, Time: %lf seconds\n", N, nprocs, end_time - start_time);
-    //print_matrix(A, N);
-    //print_matrix(B, N);
-    //print_matrix(M, N);
+    printf("NxM: %dx%d, Processes: %d, Time: %lf seconds\n", M_width, M_height, nprocs, end_time - start_time);
   }
 
   /* teardown */
   if (rank == ROOT)
   {
-    free(A);
     free(M);
-    free(counts);
-    free(displs);
+    free(col_out);
+    free(scatter_counts);
+    free(scatter_displs);
+    free(gather_counts);
+    free(gather_displs);
   }
-  free(B);
-  free(local_A);
+  free(local_M);
   free(result);
 
   MPI_Finalize();
@@ -158,10 +237,10 @@ void im2col(
   }
 }
 
-/* makes an NxN matrix of random float values from 0 - 1 */
-MATRIX make_matrix(int N)
+/* makes an NxM matrix of random float values from 0 - 1 */
+MATRIX make_matrix(int N, int M)
 {
-  int size = N*N;
+  int size = N*M;
   MATRIX matrix = (MATRIX) scalloc(size, sizeof(float));
 
   for (int i = 0; i < size; i++)
@@ -172,19 +251,19 @@ MATRIX make_matrix(int N)
 }
 
 /* for debugging purposes */
-void print_matrix(MATRIX M, int N)
+void print_matrix(MATRIX M, int W, int H)
 {
-  for (int i = 0; i < N; i++){
+  for (int i = 0; i < H; i++){
     
     if(i == 0) printf("[[");
     else printf("\n[");
 
-    for (int j = 0; j < N; j++){
-      if(j == N-1) printf("%f", M[i*N + j]);
-      else printf("%f, ", M[i*N + j]);
+    for (int j = 0; j < W; j++){
+      if(j == W-1) printf("%f", M[i*H + j]);
+      else printf("%f, ", M[i*H + j]);
     }
 
-    if(i == N-1) printf("]");
+    if(i == H-1) printf("]");
     else printf("],");
   }
   printf("]\n\n");
